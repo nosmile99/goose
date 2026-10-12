@@ -1,3 +1,4 @@
+use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     Annotations as AcpAnnotations, ClientCapabilities, CloseSessionRequest, ContentBlock,
     ContentChunk, EnvVariable, HttpHeader, ImageContent, InitializeRequest, InitializeResponse,
@@ -9,10 +10,9 @@ use agent_client_protocol::schema::v1::{
     SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModeResponse, StopReason,
     TextContent, ToolCallContent, ToolCallStatus, ToolKind,
 };
-use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{Agent, Client, ConnectionTo};
-use agent_client_protocol_schema::v1::Usage as AcpUsage;
 use agent_client_protocol_schema::v1::AGENT_METHOD_NAMES;
+use agent_client_protocol_schema::v1::Usage as AcpUsage;
 use anyhow::{Context, Result};
 use async_stream::try_stream;
 use futures::future::BoxFuture;
@@ -23,17 +23,17 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread::JoinHandle;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
-use tokio::sync::{mpsc, oneshot, watch, Mutex as TokioMutex};
+use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot, watch};
 use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 
 use crate::acp::handoff::{build_handoff_context_memo, memo_token_budget, prompt_token_cost};
-use crate::acp::{map_permission_response, PermissionDecision};
+use crate::acp::{PermissionDecision, map_permission_response};
 use crate::config::{Config, ExtensionConfig, GooseMode};
 use crate::conversation::message::{Message, MessageContent, TOOL_META_EXTERNAL_DISPATCH_KEY};
 use crate::permission::permission_confirmation::PrincipalType;
@@ -520,9 +520,15 @@ impl AcpProvider {
     /// via a config option (e.g. Copilot) need this so resumed or switched
     /// sessions actually use the requested model instead of the agent default.
     async fn apply_model_if_changed(&self, model_name: &str) -> Result<()> {
-        let Some(config_id) = self.model_config_option_id.clone() else {
+        let Some(configured_id) = self.model_config_option_id.clone() else {
             return Ok(());
         };
+        // Prefer the id the agent advertised for the Model category; the
+        // configured id is only a fallback for agents that do not advertise
+        // their config options.
+        let config_id = self
+            .advertised_config_option_id(SessionConfigOptionCategory::Model)
+            .unwrap_or(configured_id);
         if model_name == ACP_CURRENT_MODEL {
             return Ok(());
         }
@@ -622,14 +628,21 @@ impl AcpProvider {
         Ok(response_rx)
     }
 
-    fn session_has_config_option(&self, category: SessionConfigOptionCategory) -> bool {
+    /// Returns the id the agent advertised for the first config option in the
+    /// given category, or `None` if the agent advertised none. Config options
+    /// are matched by category on the read path, so the write path must use
+    /// the advertised id — not a hardcoded one — or an agent that renames an
+    /// id while keeping the category fails silently on apply.
+    fn advertised_config_option_id(&self, category: SessionConfigOptionCategory) -> Option<String> {
         self.session
             .lock()
             .unwrap()
             .response
             .config_options
-            .as_ref()
-            .is_some_and(|opts| opts.iter().any(|o| o.category.as_ref() == Some(&category)))
+            .as_ref()?
+            .iter()
+            .find(|o| o.category.as_ref() == Some(&category))
+            .map(|o| o.id.0.to_string())
     }
 
     fn claim_handoff_context(&self, messages: &[Message]) -> HandoffContextClaim {
@@ -725,8 +738,10 @@ impl Provider for AcpProvider {
                         candidates.join(", ")
                     ))
                 })?;
-            if self.session_has_config_option(SessionConfigOptionCategory::Mode) {
-                self.send_set_config_option(session_id, "mode".into(), mode_str)
+            if let Some(config_id) =
+                self.advertised_config_option_id(SessionConfigOptionCategory::Mode)
+            {
+                self.send_set_config_option(session_id, config_id, mode_str)
                     .await
                     .map_err(|e| {
                         ProviderError::RequestFailed(format!("Failed to set mode: {e}"))
@@ -3407,6 +3422,121 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    #[tokio::test]
+    async fn apply_model_if_changed_writes_advertised_model_config_id() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (mut provider, _) = test_provider_with_tx(Some(tx));
+        provider.model_config_option_id = Some("model".to_string());
+        // The agent renamed the id but kept the category: discovery matches
+        // by category, so the write must use the advertised id, not "model".
+        provider.session.lock().unwrap().response = NewSessionResponse::new("test-session")
+            .config_options(vec![
+                SessionConfigOption::select(
+                    "model_v2",
+                    "Model",
+                    "old-model",
+                    vec![
+                        SessionConfigSelectOption::new("old-model", "Old model"),
+                        SessionConfigSelectOption::new("new-model", "New model"),
+                    ],
+                )
+                .category(SessionConfigOptionCategory::Model),
+            ]);
+
+        let handle =
+            tokio::spawn(async move { provider.apply_model_if_changed("new-model").await });
+
+        match rx.recv().await.expect("expected a SetConfigOption request") {
+            ClientRequest::SetConfigOption {
+                config_id,
+                value,
+                response_tx,
+                ..
+            } => {
+                assert_eq!(config_id, "model_v2");
+                assert_eq!(value, "new-model");
+                let _ = response_tx.send(Ok(()));
+            }
+            _ => panic!("unexpected request kind"),
+        }
+
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn apply_model_if_changed_falls_back_to_configured_id() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let provider = test_provider_with_model_option(tx, Some("old-model".to_string()));
+
+        let handle =
+            tokio::spawn(async move { provider.apply_model_if_changed("new-model").await });
+
+        match rx.recv().await.expect("expected a SetConfigOption request") {
+            ClientRequest::SetConfigOption {
+                config_id,
+                response_tx,
+                ..
+            } => {
+                assert_eq!(config_id, "model");
+                let _ = response_tx.send(Ok(()));
+            }
+            _ => panic!("unexpected request kind"),
+        }
+
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_mode_writes_advertised_mode_config_id() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (mut provider, _) = test_provider_with_tx(Some(tx));
+        provider.mode_mapping = HashMap::from([(
+            GooseMode::Auto,
+            vec!["full-access".to_string(), "agent-full-access".to_string()],
+        )]);
+        // The agent renamed the id but kept the category: the Mode-category
+        // check passes, so the write must use the advertised id, not "mode".
+        provider.session.lock().unwrap().response = NewSessionResponse::new("test-session")
+            .modes(mode_state("read-only", &["read-only", "agent-full-access"]))
+            .config_options(vec![
+                SessionConfigOption::select(
+                    "mode_v2",
+                    "Mode",
+                    "agent",
+                    vec![
+                        SessionConfigSelectOption::new("agent", "Agent"),
+                        SessionConfigSelectOption::new("agent-full-access", "Agent full access"),
+                    ],
+                )
+                .category(SessionConfigOptionCategory::Mode),
+            ]);
+
+        let handle = tokio::spawn(async move {
+            provider
+                .update_mode("session", GooseMode::Auto)
+                .await
+                .unwrap();
+            provider
+        });
+
+        match rx.recv().await.expect("expected a SetConfigOption request") {
+            ClientRequest::SetConfigOption {
+                config_id,
+                value,
+                response_tx,
+                ..
+            } => {
+                assert_eq!(config_id, "mode_v2");
+                assert_eq!(value, "agent-full-access");
+                let _ = response_tx.send(Ok(()));
+            }
+            _ => panic!("unexpected request kind"),
+        }
+
+        let provider = handle.await.unwrap();
+        assert_eq!(*provider.goose_mode.lock().unwrap(), GooseMode::Auto);
+    }
+
     fn effort_select_options(values: &[&str]) -> Vec<SessionConfigSelectOption> {
         values
             .iter()
@@ -3523,16 +3653,18 @@ mod tests {
 
     #[test]
     fn extract_effort_capability_keeps_agent_labels() {
-        let options = vec![SessionConfigOption::select(
-            "effort",
-            "Thinking",
-            "default",
-            vec![
-                SessionConfigSelectOption::new("default", "Default"),
-                SessionConfigSelectOption::new("xhigh", "Extra high"),
-            ],
-        )
-        .category(SessionConfigOptionCategory::ThoughtLevel)];
+        let options = vec![
+            SessionConfigOption::select(
+                "effort",
+                "Thinking",
+                "default",
+                vec![
+                    SessionConfigSelectOption::new("default", "Default"),
+                    SessionConfigSelectOption::new("xhigh", "Extra high"),
+                ],
+            )
+            .category(SessionConfigOptionCategory::ThoughtLevel),
+        ];
 
         let capability =
             extract_effort_capability(&options).expect("effort option should be found");
@@ -3549,24 +3681,26 @@ mod tests {
 
     #[test]
     fn extract_effort_capability_flattens_grouped_values() {
-        let options = vec![SessionConfigOption::select(
-            "effort",
-            "Thinking",
-            "medium",
-            vec![
-                SessionConfigSelectGroup::new(
-                    "standard",
-                    "Standard",
-                    effort_select_options(&["low", "medium"]),
-                ),
-                SessionConfigSelectGroup::new(
-                    "extended",
-                    "Extended",
-                    effort_select_options(&["high", "max"]),
-                ),
-            ],
-        )
-        .category(SessionConfigOptionCategory::ThoughtLevel)];
+        let options = vec![
+            SessionConfigOption::select(
+                "effort",
+                "Thinking",
+                "medium",
+                vec![
+                    SessionConfigSelectGroup::new(
+                        "standard",
+                        "Standard",
+                        effort_select_options(&["low", "medium"]),
+                    ),
+                    SessionConfigSelectGroup::new(
+                        "extended",
+                        "Extended",
+                        effort_select_options(&["high", "max"]),
+                    ),
+                ],
+            )
+            .category(SessionConfigOptionCategory::ThoughtLevel),
+        ];
 
         let capability =
             extract_effort_capability(&options).expect("effort option should be found");
@@ -3583,13 +3717,15 @@ mod tests {
 
     #[test]
     fn extract_effort_capability_returns_none_without_effort_option() {
-        let options = vec![SessionConfigOption::select(
-            "model",
-            "Model",
-            "sonnet",
-            effort_select_options(&["sonnet"]),
-        )
-        .category(SessionConfigOptionCategory::Model)];
+        let options = vec![
+            SessionConfigOption::select(
+                "model",
+                "Model",
+                "sonnet",
+                effort_select_options(&["sonnet"]),
+            )
+            .category(SessionConfigOptionCategory::Model),
+        ];
 
         assert!(extract_effort_capability(&options).is_none());
     }
@@ -3597,13 +3733,15 @@ mod tests {
     #[test]
     fn config_option_update_replaces_effort_state() {
         let effort_state = Arc::new(Mutex::new(Some(effort_capability(&["low"], "low"))));
-        let update = ConfigOptionUpdate::new(vec![SessionConfigOption::select(
-            "effort",
-            "Thinking",
-            "xhigh",
-            effort_select_options(&["default", "xhigh"]),
-        )
-        .category(SessionConfigOptionCategory::ThoughtLevel)]);
+        let update = ConfigOptionUpdate::new(vec![
+            SessionConfigOption::select(
+                "effort",
+                "Thinking",
+                "xhigh",
+                effort_select_options(&["default", "xhigh"]),
+            )
+            .category(SessionConfigOptionCategory::ThoughtLevel),
+        ]);
 
         refresh_effort_state(&effort_state, &update.config_options);
 
@@ -3766,10 +3904,12 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         let provider = test_provider_with_effort(tx, None);
 
-        assert!(provider
-            .set_thinking_effort("session", "off")
-            .await
-            .unwrap());
+        assert!(
+            provider
+                .set_thinking_effort("session", "off")
+                .await
+                .unwrap()
+        );
         assert!(rx.try_recv().is_err());
     }
 
